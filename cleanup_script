@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# Ensure right number of params
+if [ $# -lt 2 ]; then
+		echo 'At least 2 parameters are required!'
+		echo '  Param 1: The profile name to use'
+		echo '  Param 2: The region to use' 
+        echo '  Param 3: (Optional) dry-run. This will cause the script to only show what will be deleted without actually deleting it.'
+		exit 1
+fi
+profile=$1
+region=$2
+if ! [ -z "$3" ]; then
+     dryrun="dryrun"
+fi
+! [[ -z $dryrun ]] && echo "This is a dry-run. It will only list the entities to be deleted without actually deleting them"
+
+
+# List and delete SNS topics
+echo "-----------Cleaning SNS Topics-------------------------------------------"
+sns_topic_arns=`aws sns list-topics --profile $profile --region $region | jq -r '.Topics[] | select(.TopicArn |test("Research-Product-Events")) | [.TopicArn]'`
+
+echo $sns_topic_arns | jq -r '.[]' | while read i; do
+    echo "$i"
+    # do the deletion here
+    if ! [ "$dryrun" == 'dryrun' ]; then
+    aws sns delete-topic --topic-arn $i --profile $profile --region $region
+    fi
+done
+
+# List and delete Sagemaker notebook lifecycle configs
+echo "-----------Cleaning Sagemaker Notebook Lifecyle Configs------------------"
+sagemaker_nblc=`aws sagemaker list-notebook-instance-lifecycle-configs --profile $profile --region $region | jq -r '.NotebookInstanceLifecycleConfigs[] | select(.NotebookInstanceLifecycleConfigName|test("Research-Portal")) | [.NotebookInstanceLifecycleConfigName]'`
+
+echo $sagemaker_nblc | jq -r '.[]' | while read i; do
+    echo "$i"
+    # do the deletion here
+    if ! [ "$dryrun" == 'dryrun' ]; then
+    aws sagemaker delete-notebook-instance-lifecycle-config --notebook-instance-lifecycle-config-name $i --profile $profile --region $region
+    fi
+done
+
+# List the roles attached to portfolios created by RG and detach them from the portfolios
+# If roles are not detached, the portfolios cannot be deleted. 
+echo "-----------Detaching roles from portfolios-------------------------------"
+sc_portfolios=`aws servicecatalog list-portfolios --region $region --profile $profile | jq -r '.PortfolioDetails[] | select(.DisplayName|test("^RGPortfolio")) | [.Id]'`
+
+echo $sc_portfolios | jq -r '.[]' | while read i; do 
+    echo "Checking principals attached to portfolio $i"
+    principals=`aws servicecatalog list-principals-for-portfolio --portfolio-id $i --profile $profile --region $region | jq -r '.Principals[] | [.PrincipalARN]'`
+
+    echo $principals | jq -r '.[]' | while read j; do
+        echo $j
+            # detach each principal here.
+            if ! [ "$dryrun" == 'dryrun' ]; then
+                aws servicecatalog disassociate-principal-from-portfolio --portfolio-id $i --principal-arn $j --profile $profile --region $region
+            fi
+    done
+done
+
+# List and delete the CF stacks (portfolios, products)
+echo "-----------Deleting Stacks-----------------------------------------------"
+cf_stacks=`aws cloudformation list-stacks --profile $profile --region $region --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE CREATE_IN_PROGRESS CREATE_FAILED ROLLBACK_IN_PROGRESS ROLLBACK_FAILED ROLLBACK_COMPLETE UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_FAILED UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_FAILED UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE| jq -r '.StackSummaries[] | select(.StackName | test("^RG.*")) | [.StackName]'`
+echo $cf_stacks | jq -r '.[]' |  while read i; do
+    echo "$i"
+    # do the deletion here
+    if ! [ "$dryrun" == 'dryrun' ]; then
+        aws cloudformation delete-stack --stack-name $i --profile $profile --region $region
+    fi
+done
+
+# List IAM policies
+iam_policies=`aws iam list-policies --scope Local --only-attached --profile $profile --region $region | jq -r '.Policies[] | select(.PolicyName|test("RGPortal")) | [.Arn]'` 
+
+# List and delete IAM roles after first detaching the custom policies
+echo "-----------Deleting roles------------------------------------------------"
+iam_roles=`aws iam list-roles --profile $profile --region $region | jq -r '.Roles[] | select(.RoleName|test("RGPortalUser")) | [.RoleName]'`
+echo $iam_roles | jq -r '.[]' |  while read i; do
+    echo "$i"
+    attached_policies=`aws iam list-attached-role-policies --role-name $i --profile $profile --region $region | jq -r '.AttachedPolicies[]|[.PolicyArn]'`
+    echo $attached_policies | jq -r '.[]' | while read j; do
+        echo $j
+        # Iterate over the $iam_policies and see if one of those is attached. 
+        echo $iam_policies | jq -r '.[]' | while read k; do
+            # If yes, detach it
+            if [ "$j" == "$k" ]; then
+                echo "$j policy is attached to role $i so detaching"
+                if ! [ "$dryrun" == 'dryrun' ]; then
+                    aws iam detach-role-policy --role-name $i --policy-arn $j --profile $profile --region $region
+                fi
+            fi
+        done
+    done
+    # do the deletion of the role here
+    if ! [ "$dryrun" == 'dryrun' ]; then
+        aws iam delete-role --role-name $i --profile $profile --region $region
+    fi
+done
+
+# Delete the policies (only custom ones which were attached)
+echo "-----------Deleting policies---------------------------------------------"
+echo $iam_policies | jq -r '.[]' |  while read i; do
+     echo "$i"
+     # do the deletion here
+     if ! [ "$dryrun" == 'dryrun' ]; then
+         aws iam delete-policy --policy-arn $i --profile $profile --region $region
+     fi
+done
+
+# List and delete Budgets 
+echo "-----------------Cleaning Budgets------------------------"
+account=`aws sts get-caller-identity --profile $profile --region $region | jq -r '.Account'`
+echo "Using account $account"
+Budgets=`aws budgets describe-budgets --account-id "$account" --profile $profile --region $region | jq -r '.Budgets[] | select(.BudgetName |test ("RG")) | [.BudgetName]'`
+echo $Budgets | jq -r '.[]' | while read i; do
+    echo "$i"
+    # do the deletion here
+    if ! [ "$dryrun" == 'dryrun' ]; then
+       aws budgets delete-budget --account-id $account --profile $profile --region $region  --budget-name "$i"
+    fi
+done
+
+# List and delete s3 buckets
+echo "-----------------Cleaning S3 buckets------------------------"
+s3_Bucket_Name=`aws s3api list-buckets --profile $profile --region $region | jq -r '.Buckets[] | select(.Name |test("RGPortal")) | [.Name]'`
+
+echo $s3_Bucket_Name | jq -r '.[]' | while read i; do
+    echo "$i"
+    # do the deletion here
+    if ! [ "$dryrun" == 'dryrun' ]; then
+       aws s3api delete-bucket --bucket $1 --profile $profile --region $region 
+    fi
+done
