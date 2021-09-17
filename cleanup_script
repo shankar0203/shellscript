@@ -131,3 +131,4 @@ echo $s3_Bucket_Name | jq -r '.[]' | while read i; do
        aws s3api delete-bucket --bucket $1 --profile $profile --region $region 
     fi
 done
+
